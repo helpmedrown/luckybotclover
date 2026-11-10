@@ -346,15 +346,49 @@ class RegisterView(discord.ui.View):
         await interaction.response.send_modal(RegisterModal())
 
 
+_BASIC_OVERWRITES = (
+    "view_channel",
+    "send_messages",
+    "embed_links",
+    "read_message_history",
+    "add_reactions",
+    "manage_messages",
+)
+_BOT_OVERWRITE = {
+    "view_channel": True,
+    "send_messages": True,
+    "embed_links": True,
+    "read_message_history": True,
+    "manage_messages": True,
+}
+_PANEL_PERMS = (
+    ("view_channel", "просмотр канала"),
+    ("send_messages", "отправка сообщений"),
+    ("embed_links", "вставка ссылок"),
+    ("read_message_history", "чтение истории"),
+)
+
+
+def missing_panel_perms(channel: discord.TextChannel, member: discord.Member) -> list[str]:
+    perms = channel.permissions_for(member)
+    return [label for attr, label in _PANEL_PERMS if not getattr(perms, attr)]
+
+
+def panel_denied_text(missing: list[str]) -> str:
+    shown = ", ".join(missing)
+    return (
+        f"Не могу опубликовать анкету: в этом канале боту не хватает прав ({shown}). "
+        "В настройках канала разреши их роли бота. "
+        "Запрет @everyone на отправку сообщений сам по себе бота тоже блокирует, "
+        "если у его роли нет отдельного разрешения."
+    )
+
+
 async def _put(channel: discord.abc.GuildChannel, target: discord.abc.Snowflake, **perms: bool) -> None:
     try:
         await channel.set_permissions(target, reason=REASON, **perms)
     except discord.HTTPException:
-        basic = {
-            key: perms[key]
-            for key in ("view_channel", "send_messages", "read_message_history", "add_reactions")
-            if key in perms
-        }
+        basic = {key: perms[key] for key in _BASIC_OVERWRITES if key in perms}
         if not basic or basic == perms:
             raise
         await channel.set_permissions(target, reason=REASON, **basic)
@@ -412,7 +446,7 @@ async def lock_channels(guild: discord.Guild, bot_id: int) -> str:
                 await _put(channel, everyone, view_channel=False)
                 await _put(channel, initiate, view_channel=True)
             if bot_role.id != everyone.id:
-                await _put(channel, bot_role, view_channel=True)
+                await _put(channel, bot_role, **_BOT_OVERWRITE)
             updated += 1
         except discord.HTTPException as exc:
             failed.append(channel.name)
@@ -524,6 +558,22 @@ async def reg_panel(interaction: discord.Interaction) -> None:
     if not isinstance(channel, discord.TextChannel) or interaction.guild_id != GUILD_ID:
         await reply(interaction, "Открой команду в текстовом канале сервера.")
         return
+    guild = interaction.guild
+    bot_user = interaction.client.user
+    if guild is not None and bot_user is not None:
+        me = guild.me
+        if me is None:
+            try:
+                me = await guild.fetch_member(bot_user.id)
+            except discord.HTTPException as exc:
+                print(f"bot member lookup failed: {exc}", flush=True)
+                me = None
+        if me is not None:
+            missing = missing_panel_perms(channel, me)
+            if missing:
+                print(f"reg-panel missing perms: {', '.join(missing)}", flush=True)
+                await reply(interaction, panel_denied_text(missing))
+                return
 
     await interaction.response.defer(ephemeral=True)
     existing: discord.Message | None = None
@@ -538,12 +588,20 @@ async def reg_panel(interaction: discord.Interaction) -> None:
 
     embed = panel_embed()
     view = RegisterView()
-    if existing is None:
-        message = await channel.send(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
-        status = "Анкета опубликована в этом канале."
-    else:
-        message = await existing.edit(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
-        status = "Анкета в этом канале обновлена."
+    try:
+        if existing is None:
+            message = await channel.send(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
+            status = "Анкета опубликована в этом канале."
+        else:
+            message = await existing.edit(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
+            status = "Анкета в этом канале обновлена."
+    except discord.Forbidden:
+        print("reg-panel forbidden", flush=True)
+        await interaction.followup.send(
+            panel_denied_text(["просмотр канала", "отправка сообщений", "вставка ссылок"]),
+            ephemeral=True,
+        )
+        return
 
     if not message.pinned:
         try:
@@ -554,6 +612,18 @@ async def reg_panel(interaction: discord.Interaction) -> None:
     if channel.id != REG_CHANNEL_ID:
         status += " Это не канал из REG_CHANNEL_ID: /reg-lock откроет людям другой канал."
     await interaction.followup.send(status, ephemeral=True)
+
+
+@client.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    cause = error.original if isinstance(error, app_commands.CommandInvokeError) else error
+    print(f"command error: {cause!r}", flush=True)
+    traceback.print_exc()
+    if isinstance(cause, discord.Forbidden):
+        text = panel_denied_text(["просмотр канала", "отправка сообщений", "вставка ссылок"])
+    else:
+        text = "Команда не выполнилась. Подробности в логе хостинга."
+    await reply(interaction, text)
 
 
 @client.tree.command(
